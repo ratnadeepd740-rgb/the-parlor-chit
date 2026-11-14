@@ -11,6 +11,7 @@ import {
   doc,
   setDoc,
   getDoc,
+  updateDoc,
   onSnapshot,
 } from 'firebase/firestore';
 import {
@@ -227,6 +228,14 @@ function generatePlayerCode(existingSet) {
   existingSet.add(code);
   return code;
 }
+
+// Single source of truth for the Firestore room document reference
+const getRoomRef = (code) =>
+  db
+    ? doc(db, 'artifacts', appId, 'public', 'data', 'parlor_rooms', code)
+    : null;
+
+const SESSION_KEY = 'parlor_chit_session';
 
 // ============================================================================
 // REUSABLE EDITORIAL DESIGN SYSTEM COMPONENTS
@@ -870,6 +879,17 @@ export default function App() {
     ],
   });
 
+  // Always-current copy of game state (avoids stale closures & side effects inside setState)
+  const gameStateRef = useRef(gameState);
+  useEffect(() => {
+    gameStateRef.current = gameState;
+  }, [gameState]);
+
+  // Host = the device that created the room (always true offline)
+  const isHost =
+    gameMode !== 'ONLINE' ||
+    (!!user && !!gameState.hostUid && gameState.hostUid === user.uid);
+
   // Toast Notification helper
   const triggerToast = (msg) => {
     setToastMessage(msg);
@@ -938,12 +958,18 @@ export default function App() {
     const unsub = onSnapshot(
       roomDocRef,
       (snapshot) => {
+        // Ignore echoes of our own not-yet-confirmed writes (prevents flicker/rollback)
+        if (snapshot.metadata.hasPendingWrites) return;
         if (snapshot.exists()) {
           const remoteData = snapshot.data();
           if (remoteData && remoteData.players) {
+            gameStateRef.current = remoteData;
             setGameState(remoteData);
             setSyncStatus('synced');
           }
+        } else {
+          setSyncStatus('local');
+          triggerToast('This room no longer exists.');
         }
       },
       (err) => {
@@ -955,27 +981,39 @@ export default function App() {
     return () => unsub();
   }, [gameMode, roomCode, user]);
 
-  // Unified state updater that persists to Firestore when in ONLINE mode
+  // Unified state updater that persists to Firestore when in ONLINE mode.
+  // The write happens exactly once, outside the React updater (StrictMode-safe).
   const commitGameState = (updater) => {
-    setGameState((prev) => {
-      const next = typeof updater === 'function' ? updater(prev) : updater;
-      if (gameMode === 'ONLINE' && roomCode && db && user) {
-        const roomDocRef = doc(
-          db,
-          'artifacts',
-          appId,
-          'public',
-          'data',
-          'parlor_rooms',
-          roomCode
-        );
-        setDoc(roomDocRef, next).catch((e) =>
-          console.warn('Sync write error:', e)
-        );
-      }
-      return next;
-    });
+    const prev = gameStateRef.current;
+    const next = typeof updater === 'function' ? updater(prev) : updater;
+    gameStateRef.current = next;
+    setGameState(next);
+    if (gameMode === 'ONLINE' && roomCode && db && user) {
+      setDoc(getRoomRef(roomCode), next).catch((e) => {
+        console.warn('Sync write error:', e);
+        setSyncStatus('local');
+        triggerToast('Sync failed — check your connection.');
+      });
+    }
   };
+
+  // Persist session so a refresh doesn't kick the player out of the room
+  useEffect(() => {
+    try {
+      if (gameMode === 'ONLINE' && roomCode) {
+        sessionStorage.setItem(SESSION_KEY, JSON.stringify({ roomCode }));
+      }
+    } catch {
+      /* storage unavailable */
+    }
+  }, [gameMode, roomCode]);
+
+  // Players should never keep a stale chit open once a new round resets the deck
+  useEffect(() => {
+    if (gameState.phase === 'LOBBY' || gameState.phase === 'ROLE_SETUP') {
+      setUnlockedPlayerId(null);
+    }
+  }, [gameState.phase]);
 
   // ============================================================================
   // 2. DISCUSSION TIMER EFFECT
@@ -1028,39 +1066,86 @@ export default function App() {
   };
 
   const createOnlineRoom = async () => {
-    const newCode = generateRoomCode();
-    setGameMode('ONLINE');
-    setRoomCode(newCode);
-    setActivePerspective('GOD');
-    setIsGodAuthenticated(true);
-
-    const initialState = {
-      ...gameState,
-      roomCode: newCode,
-      mode: 'ONLINE',
-      phase: 'LOBBY',
-    };
-
-    setGameState(initialState);
-    setScreen('LOBBY');
-
-    if (db && user) {
-      try {
-        const roomDocRef = doc(
-          db,
-          'artifacts',
-          appId,
-          'public',
-          'data',
-          'parlor_rooms',
-          newCode
-        );
-        await setDoc(roomDocRef, initialState);
-        setSyncStatus('synced');
-        triggerToast(`Created live room ${newCode}`);
-      } catch (e) {
-        console.warn('Error creating online room:', e);
+    if (!db || !user) {
+      triggerToast('Online play is unavailable (Firebase not connected).');
+      return;
+    }
+    try {
+      // Avoid overwriting an existing room that happens to share the code
+      let newCode = generateRoomCode();
+      for (let i = 0; i < 8; i++) {
+        const existing = await getDoc(getRoomRef(newCode));
+        if (!existing.exists()) break;
+        newCode = generateRoomCode();
       }
+
+      const initialState = {
+        ...gameStateRef.current,
+        roomCode: newCode,
+        mode: 'ONLINE',
+        phase: 'LOBBY',
+        hostUid: user.uid,
+      };
+      await setDoc(getRoomRef(newCode), initialState);
+
+      gameStateRef.current = initialState;
+      setGameState(initialState);
+      setGameMode('ONLINE');
+      setRoomCode(newCode);
+      setActivePerspective('GOD');
+      setIsGodAuthenticated(true);
+      setSyncStatus('synced');
+      setScreen('LOBBY');
+      triggerToast(`Created live room ${newCode}`);
+    } catch (e) {
+      console.warn('Error creating online room:', e);
+      triggerToast('Could not create the room. Please try again.');
+    }
+  };
+
+  const joinRoomByCode = async (code, silent = false) => {
+    if (!db || !user) {
+      setJoinCodeError('Online play is unavailable. Check your connection.');
+      return false;
+    }
+    try {
+      const snap = await getDoc(getRoomRef(code));
+      if (!snap.exists()) {
+        if (!silent)
+          setJoinCodeError(
+            `Room "${code}" was not found. Check the code with your host.`
+          );
+        return false;
+      }
+      const data = snap.data();
+      const amHost = !!data.hostUid && data.hostUid === user.uid;
+      gameStateRef.current = data;
+      setGameState(data);
+      setGameMode('ONLINE');
+      setRoomCode(code);
+      setUnlockedPlayerId(null);
+      if (amHost) {
+        // Host returning after a refresh: back to the console, behind the passcode
+        setActivePerspective('GOD');
+        setIsGodAuthenticated(false);
+        setScreen(
+          data.phase === 'LOBBY'
+            ? 'LOBBY'
+            : data.phase === 'ROLE_SETUP'
+            ? 'ROLE_SETUP'
+            : 'GAME_TABLE'
+        );
+      } else {
+        setActivePerspective('PLAYER_DEVICE');
+        setIsGodAuthenticated(false);
+        setScreen('GAME_TABLE');
+      }
+      if (!silent) triggerToast(`Joined Room ${code}`);
+      return true;
+    } catch (err) {
+      console.warn('Join error:', err);
+      if (!silent) setJoinCodeError('Unable to connect to room. Please try again.');
+      return false;
     }
   };
 
@@ -1072,49 +1157,31 @@ export default function App() {
       return;
     }
     setJoinCodeError('');
-
-    if (db && user) {
-      try {
-        const roomDocRef = doc(
-          db,
-          'artifacts',
-          appId,
-          'public',
-          'data',
-          'parlor_rooms',
-          cleaned
-        );
-        const snap = await getDoc(roomDocRef);
-        if (!snap.exists()) {
-          setJoinCodeError(
-            `Room "${cleaned}" was not found. Check the code with your host.`
-          );
-          return;
-        }
-        const data = snap.data();
-        setGameState(data);
-        setGameMode('ONLINE');
-        setRoomCode(cleaned);
-        setActivePerspective('PLAYER_DEVICE');
-        setIsGodAuthenticated(false);
-        setScreen('GAME_TABLE');
-        triggerToast(`Joined Room ${cleaned}`);
-      } catch (err) {
-        setJoinCodeError('Unable to connect to room. Please try again.');
-      }
-    } else {
-      setGameMode('ONLINE');
-      setRoomCode(cleaned);
-      setActivePerspective('PLAYER_DEVICE');
-      setIsGodAuthenticated(false);
-      setScreen('GAME_TABLE');
-    }
+    await joinRoomByCode(cleaned);
   };
+
+  // Auto-rejoin the last room after a page refresh
+  const triedRejoin = useRef(false);
+  useEffect(() => {
+    if (triedRejoin.current || !user || !db) return;
+    triedRejoin.current = true;
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null');
+      if (saved?.roomCode) joinRoomByCode(saved.roomCode, true);
+    } catch {
+      /* ignore */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
 
   // ============================================================================
   // 4. GOD CONSOLE PASSCODE VERIFICATION & CUSTOMIZATION HANDLERS
   // ============================================================================
   const handleSwitchToGodTab = () => {
+    if (!isHost) {
+      triggerToast('Only the room host can open the God Console.');
+      return;
+    }
     setActivePerspective('GOD');
     setGodPinError('');
     setGodPinAttempt('');
@@ -1132,6 +1199,10 @@ export default function App() {
 
   const handleVerifyGodPasscode = (e) => {
     if (e) e.preventDefault();
+    if (!isHost) {
+      setGodPinError('Only the room host can open the God Console.');
+      return;
+    }
     const cleaned = godPinAttempt.trim().toUpperCase();
     const expected = (gameState.godPasscode || '0000').trim().toUpperCase();
     if (cleaned === expected) {
@@ -1622,16 +1693,30 @@ export default function App() {
 
   // Cast vote from player's own phone (Online / Unlocked view)
   const handlePlayerCastVote = (voterId, suspectId) => {
-    commitGameState((prev) => ({
-      ...prev,
+    const cur = gameStateRef.current;
+    const voter = cur.players.find((p) => p.id === voterId);
+    if (cur.phase !== 'DAY' || !voter || voter.status !== 'ALIVE') {
+      triggerToast('Voting is closed.');
+      return;
+    }
+    const next = {
+      ...cur,
       dayState: {
-        ...prev.dayState,
-        votesByVoter: {
-          ...prev.dayState.votesByVoter,
-          [voterId]: suspectId,
-        },
+        ...cur.dayState,
+        votesByVoter: { ...(cur.dayState.votesByVoter || {}), [voterId]: suspectId },
       },
-    }));
+    };
+    gameStateRef.current = next;
+    setGameState(next);
+    if (gameMode === 'ONLINE' && roomCode && db && user) {
+      // Field-level update: simultaneous votes from different phones no longer overwrite each other
+      updateDoc(getRoomRef(roomCode), {
+        [`dayState.votesByVoter.${voterId}`]: suspectId,
+      }).catch((e) => {
+        console.warn('Vote sync error:', e);
+        triggerToast('Vote failed to sync — please try again.');
+      });
+    }
     triggerToast('Your ballot has been recorded.');
   };
 
@@ -1828,7 +1913,7 @@ export default function App() {
             <div className="w-48 h-48 mx-auto bg-[#FAF7F0] border-2 border-[#E5DEC9] rounded-2xl p-4 flex flex-col items-center justify-center mb-6 shadow-inner">
               <img
                 src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&color=14362B&bgcolor=FAF7F0&data=${encodeURIComponent(
-                  `${window.location.href}?room=${roomCode}`
+                  `${window.location.origin}${window.location.pathname}?room=${roomCode}`
                 )}`}
                 alt={`QR Code for Room ${roomCode}`}
                 className="w-full h-full object-contain rounded"
@@ -2691,7 +2776,22 @@ export default function App() {
              ================================================================= */}
           {activePerspective === 'PLAYER_DEVICE' && (
             <div className="max-w-xl mx-auto py-4 animate-fadeIn">
-              {!unlockedPlayerId ? (
+              {gameState.phase === 'LOBBY' || gameState.phase === 'ROLE_SETUP' ? (
+                <div className="border rounded-3xl p-8 sm:p-10 shadow-lg text-center bg-[#FFFDF9] border-[#E5DEC9] text-[#14362B]">
+                  <Eyebrow className="justify-center mb-3">
+                    WAITING FOR THE HOST
+                  </Eyebrow>
+                  <h2 className="font-serif text-3xl mb-3">
+                    The parlor is{' '}
+                    <span className="italic text-[#A67C46]">gathering.</span>
+                  </h2>
+                  <p className="text-sm text-[#4A5D56] leading-relaxed">
+                    {godPlayer?.name} is still arranging guests and roles. Your
+                    cipher entry will appear here automatically once chits are
+                    dealt.
+                  </p>
+                </div>
+              ) : !unlockedPlayerId ? (
                 /* Secret Code Entry Card */
                 <div
                   className={`border rounded-3xl p-7 sm:p-10 shadow-lg text-center transition-colors duration-700 ${
