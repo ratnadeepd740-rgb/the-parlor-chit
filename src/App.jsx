@@ -12,6 +12,7 @@ import {
   setDoc,
   getDoc,
   updateDoc,
+  runTransaction,
   onSnapshot,
 } from 'firebase/firestore';
 import {
@@ -236,6 +237,34 @@ const getRoomRef = (code) =>
     : null;
 
 const SESSION_KEY = 'parlor_chit_session';
+
+// Pure ballot tally: one live vote per living voter (re-voting REPLACES the old vote),
+// plus the God's manual +/- adjustments. The God/spectator never votes or is voted for.
+const computeTallies = (st) => {
+  const living = st.players.filter(
+    (p) => p.id !== st.godPlayerId && p.status === 'ALIVE'
+  );
+  const livingIds = new Set(living.map((p) => p.id));
+  const tallies = {};
+  living.forEach((p) => {
+    tallies[p.id] = 0;
+  });
+  Object.entries(st.dayState.votesByVoter || {}).forEach(([voterId, suspectId]) => {
+    if (livingIds.has(voterId) && tallies[suspectId] !== undefined) {
+      tallies[suspectId] += 1;
+    }
+  });
+  Object.entries(st.dayState.manualVoteTallies || {}).forEach(([suspectId, n]) => {
+    if (tallies[suspectId] !== undefined) tallies[suspectId] += n;
+  });
+  Object.keys(tallies).forEach((k) => {
+    tallies[k] = Math.max(0, tallies[k]);
+  });
+  return tallies;
+};
+
+// Shared discussion timer lives in the room document so every device sees the same clock
+const DEFAULT_TIMER = { presetMinutes: 3, running: false, endsAt: null, remaining: 180 };
 
 // ============================================================================
 // REUSABLE EDITORIAL DESIGN SYSTEM COMPONENTS
@@ -825,9 +854,12 @@ export default function App() {
   const [showQrModal, setShowQrModal] = useState(false);
 
   // Day Discussion Countdown Timer States
-  const [timerSeconds, setTimerSeconds] = useState(180);
-  const [timerPresetMinutes, setTimerPresetMinutes] = useState(3);
-  const [timerRunning, setTimerRunning] = useState(false);
+  const [, setTimerTick] = useState(0); // forces a re-render each tick while the shared timer runs
+
+  // Self-join: which roster seat belongs to this device
+  const [myPlayerId, setMyPlayerId] = useState(null);
+  const [seatNameInput, setSeatNameInput] = useState('');
+  const [seatError, setSeatError] = useState('');
 
   // Core Game State (Synced with Firestore in ONLINE mode)
   const [gameState, setGameState] = useState({
@@ -851,6 +883,7 @@ export default function App() {
     roleCounts: getSmartRolePreset(6, false),
     rules: {
       preventConsecutiveDoctorSelfSave: true,
+      godTieBreaker: false, // God (spectator) breaks tied ballots
     },
     nightState: {
       step: 1, // 1: Murderer, 2: Doctor, 3: Detective, 4: Dawn Summary
@@ -867,7 +900,11 @@ export default function App() {
       policeArrestUsed: false,
       policeArrestedId: null,
       eliminatedTodayId: null,
+      votingClosed: false,
+      tieCandidateIds: [],
+      voteNotice: '',
     },
+    timer: DEFAULT_TIMER,
     winner: null, // 'VILLAGER' | 'MURDERER' | null
     winReason: '',
     chronicle: [
@@ -884,6 +921,15 @@ export default function App() {
   useEffect(() => {
     gameStateRef.current = gameState;
   }, [gameState]);
+
+  // Derived shared-timer values (identical on every device, based on a shared end timestamp)
+  const sharedTimer = gameState.timer || DEFAULT_TIMER;
+  const timerRunning = !!sharedTimer.running && !!sharedTimer.endsAt;
+  const timerSeconds = timerRunning
+    ? Math.max(0, Math.ceil((sharedTimer.endsAt - Date.now()) / 1000))
+    : sharedTimer.remaining;
+  const timerPresetMinutes = sharedTimer.presetMinutes;
+  const myPlayer = gameState.players.find((p) => p.id === myPlayerId) || null;
 
   // Host = the device that created the room (always true offline)
   const isHost =
@@ -997,16 +1043,59 @@ export default function App() {
     }
   };
 
+  // ---- Shared timer controls (host only in the UI; state syncs to everyone) ----
+  const setTimerRunning = (arg) => {
+    const cur = gameStateRef.current.timer || DEFAULT_TIMER;
+    const curRunning = !!cur.running && !!cur.endsAt;
+    const want = typeof arg === 'function' ? arg(curRunning) : arg;
+    if (want === curRunning) return;
+    if (want) {
+      if (cur.remaining <= 0) return;
+      commitGameState((prev) => ({
+        ...prev,
+        timer: {
+          ...cur,
+          running: true,
+          endsAt: Date.now() + cur.remaining * 1000,
+        },
+      }));
+    } else {
+      const remaining = Math.max(0, Math.ceil((cur.endsAt - Date.now()) / 1000));
+      commitGameState((prev) => ({
+        ...prev,
+        timer: { ...cur, running: false, endsAt: null, remaining },
+      }));
+    }
+  };
+
+  const setTimerPreset = (mins) =>
+    commitGameState((prev) => ({
+      ...prev,
+      timer: { presetMinutes: mins, running: false, endsAt: null, remaining: mins * 60 },
+    }));
+
+  const resetTimer = () =>
+    commitGameState((prev) => {
+      const t = prev.timer || DEFAULT_TIMER;
+      return {
+        ...prev,
+        timer: { ...t, running: false, endsAt: null, remaining: t.presetMinutes * 60 },
+      };
+    });
+
   // Persist session so a refresh doesn't kick the player out of the room
   useEffect(() => {
     try {
       if (gameMode === 'ONLINE' && roomCode) {
-        sessionStorage.setItem(SESSION_KEY, JSON.stringify({ roomCode }));
+        sessionStorage.setItem(
+          SESSION_KEY,
+          JSON.stringify({ roomCode, myPlayerId })
+        );
       }
     } catch {
       /* storage unavailable */
     }
-  }, [gameMode, roomCode]);
+  }, [gameMode, roomCode, myPlayerId]);
 
   // Players should never keep a stale chit open once a new round resets the deck
   useEffect(() => {
@@ -1021,16 +1110,20 @@ export default function App() {
   useEffect(() => {
     if (!timerRunning) return;
     const interval = setInterval(() => {
-      setTimerSeconds((prev) => {
-        if (prev <= 1) {
-          setTimerRunning(false);
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
+      setTimerTick((t) => t + 1);
+      // Only the host writes the "time's up" state, so devices don't all write at once
+      const t = gameStateRef.current.timer;
+      if (isHost && t && t.running && t.endsAt && Date.now() >= t.endsAt) {
+        commitGameState((prev) => ({
+          ...prev,
+          timer: { ...(prev.timer || DEFAULT_TIMER), running: false, endsAt: null, remaining: 0 },
+        }));
+        triggerToast('Time is up! The debate has ended.');
+      }
+    }, 500);
     return () => clearInterval(interval);
-  }, [timerRunning]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timerRunning, isHost]);
 
   // Determine whether the entire room is in Nocturnal Night Atmosphere
   const isNocturnalNight =
@@ -1103,7 +1196,7 @@ export default function App() {
     }
   };
 
-  const joinRoomByCode = async (code, silent = false) => {
+  const joinRoomByCode = async (code, silent = false, savedPlayerId = null) => {
     if (!db || !user) {
       setJoinCodeError('Online play is unavailable. Check your connection.');
       return false;
@@ -1124,6 +1217,11 @@ export default function App() {
       setGameMode('ONLINE');
       setRoomCode(code);
       setUnlockedPlayerId(null);
+      setMyPlayerId(
+        savedPlayerId && data.players.some((p) => p.id === savedPlayerId)
+          ? savedPlayerId
+          : null
+      );
       if (amHost) {
         // Host returning after a refresh: back to the console, behind the passcode
         setActivePerspective('GOD');
@@ -1160,6 +1258,59 @@ export default function App() {
     await joinRoomByCode(cleaned);
   };
 
+  // Joiner adds themselves to the roster. A transaction keeps simultaneous joins from clobbering each other.
+  const handleTakeSeat = async (e) => {
+    if (e) e.preventDefault();
+    const name = seatNameInput.trim().slice(0, 20);
+    if (!name) {
+      setSeatError('Please enter your name.');
+      return;
+    }
+    if (!db || !user || !roomCode) return;
+    const ref = getRoomRef(roomCode);
+    const newId = `p_${user.uid.replace(/[^A-Za-z0-9]/g, '').slice(0, 6)}_${Date.now()}`;
+    try {
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(ref);
+        if (!snap.exists()) throw new Error('ROOM_GONE');
+        const data = snap.data();
+        if (data.phase !== 'LOBBY') throw new Error('STARTED');
+        if (data.players.length >= 16) throw new Error('FULL');
+        if (data.players.some((p) => p.name.toLowerCase() === name.toLowerCase()))
+          throw new Error('NAME_TAKEN');
+        const players = [
+          ...data.players,
+          {
+            id: newId,
+            name,
+            code: '',
+            role: 'VILLAGER',
+            isGod: false,
+            status: 'ALIVE',
+            eliminatedRound: null,
+            eliminatedReason: '',
+          },
+        ];
+        tx.update(ref, {
+          players,
+          roleCounts: getSmartRolePreset(players.length - 1, data.includePoliceRole),
+        });
+      });
+      setMyPlayerId(newId);
+      setSeatError('');
+      setSeatNameInput('');
+      triggerToast(`Welcome to the parlor, ${name}!`);
+    } catch (err) {
+      const msgs = {
+        ROOM_GONE: 'This room no longer exists.',
+        STARTED: 'The game has already started.',
+        FULL: 'The parlor is full (16 guests).',
+        NAME_TAKEN: 'That name is already taken — choose another.',
+      };
+      setSeatError(msgs[err.message] || 'Could not take a seat. Please try again.');
+    }
+  };
+
   // Auto-rejoin the last room after a page refresh
   const triedRejoin = useRef(false);
   useEffect(() => {
@@ -1167,7 +1318,8 @@ export default function App() {
     triedRejoin.current = true;
     try {
       const saved = JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null');
-      if (saved?.roomCode) joinRoomByCode(saved.roomCode, true);
+      if (saved?.roomCode)
+        joinRoomByCode(saved.roomCode, true, saved.myPlayerId || null);
     } catch {
       /* ignore */
     }
@@ -1539,6 +1691,9 @@ export default function App() {
           policeArrestUsed: false,
           policeArrestedId: null,
           eliminatedTodayId: null,
+          votingClosed: false,
+          tieCandidateIds: [],
+          voteNotice: '',
         },
         chronicle: [
           {
@@ -1682,20 +1837,29 @@ export default function App() {
           votesByVoter: {},
           manualVoteTallies: {},
           eliminatedTodayId: null,
+          votingClosed: false,
+          tieCandidateIds: [],
+          voteNotice: '',
         },
         chronicle: nextChronicle,
       };
     });
 
-    setTimerSeconds(timerPresetMinutes * 60);
-    setTimerRunning(false);
+    resetTimer();
   };
 
   // Cast vote from player's own phone (Online / Unlocked view)
   const handlePlayerCastVote = (voterId, suspectId) => {
     const cur = gameStateRef.current;
     const voter = cur.players.find((p) => p.id === voterId);
-    if (cur.phase !== 'DAY' || !voter || voter.status !== 'ALIVE') {
+    if (
+      cur.phase !== 'DAY' ||
+      !voter ||
+      voter.status !== 'ALIVE' ||
+      voter.id === cur.godPlayerId ||
+      cur.dayState.votingClosed ||
+      (cur.dayState.tieCandidateIds || []).length > 0
+    ) {
       triggerToast('Voting is closed.');
       return;
     }
@@ -1720,43 +1884,79 @@ export default function App() {
     triggerToast('Your ballot has been recorded.');
   };
 
-  // Adjust manual vote tally on God's console
+  // Adjust manual vote tally on God's console (the shown total never drops below 0)
   const handleGodAdjustManualVote = (suspectId, delta) => {
-    commitGameState((prev) => {
-      const current = prev.dayState.manualVoteTallies[suspectId] || 0;
-      const nextVal = Math.max(0, current + delta);
-      return {
-        ...prev,
-        dayState: {
-          ...prev.dayState,
-          manualVoteTallies: {
-            ...prev.dayState.manualVoteTallies,
-            [suspectId]: nextVal,
-          },
-        },
-      };
-    });
+    const cur = gameStateRef.current;
+    const shown = computeTallies(cur)[suspectId] || 0;
+    if (delta < 0 && shown <= 0) return;
+    const nextManual = (cur.dayState.manualVoteTallies[suspectId] || 0) + delta;
+    const next = {
+      ...cur,
+      dayState: {
+        ...cur.dayState,
+        manualVoteTallies: { ...cur.dayState.manualVoteTallies, [suspectId]: nextManual },
+      },
+    };
+    gameStateRef.current = next;
+    setGameState(next);
+    if (gameMode === 'ONLINE' && roomCode && db && user) {
+      // Field-level write so a simultaneous player vote is not overwritten
+      updateDoc(getRoomRef(roomCode), {
+        [`dayState.manualVoteTallies.${suspectId}`]: nextManual,
+      }).catch((e) => console.warn('Tally sync error:', e));
+    }
   };
 
   // Compute combined vote tally for each living player
-  const combinedVoteTallies = useMemo(() => {
-    const tallies = {};
-    livingActivePlayers.forEach((p) => {
-      tallies[p.id] = gameState.dayState.manualVoteTallies[p.id] || 0;
-    });
-    Object.values(gameState.dayState.votesByVoter || {}).forEach(
-      (suspectId) => {
-        if (tallies[suspectId] !== undefined) {
-          tallies[suspectId] += 1;
-        }
-      }
-    );
-    return tallies;
-  }, [
-    livingActivePlayers,
-    gameState.dayState.manualVoteTallies,
-    gameState.dayState.votesByVoter,
-  ]);
+  const combinedVoteTallies = useMemo(
+    () => computeTallies(gameState),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      gameState.players,
+      gameState.godPlayerId,
+      gameState.dayState.manualVoteTallies,
+      gameState.dayState.votesByVoter,
+    ]
+  );
+
+  // Count ballots: banish the highest-voted suspect; ties follow the God tie-breaker rule
+  const handleCountBallots = () => {
+    const cur = gameStateRef.current;
+    if (cur.phase !== 'DAY' || cur.dayState.votingClosed) return;
+    const entries = Object.entries(computeTallies(cur));
+    const max = Math.max(0, ...entries.map(([, n]) => n));
+    if (max === 0) {
+      triggerToast('No ballots have been cast yet.');
+      return;
+    }
+    const leaders = entries.filter(([, n]) => n === max).map(([id]) => id);
+    if (leaders.length === 1) {
+      handleEliminateSuspectByVote(leaders[0], false);
+      return;
+    }
+    const names = leaders
+      .map((id) => cur.players.find((p) => p.id === id)?.name)
+      .join(', ');
+    if (cur.rules.godTieBreaker) {
+      commitGameState((prev) => ({
+        ...prev,
+        dayState: {
+          ...prev.dayState,
+          tieCandidateIds: leaders,
+          voteNotice: `Tie at ${max} votes: ${names}. The Moderator casts the deciding vote.`,
+        },
+      }));
+    } else {
+      commitGameState((prev) => ({
+        ...prev,
+        dayState: {
+          ...prev.dayState,
+          tieCandidateIds: [],
+          voteNotice: `Tie at ${max} votes: ${names}. No one is banished unless a vote changes.`,
+        },
+      }));
+    }
+  };
 
   // Execute Day Elimination or Police Public Arrest
   const handleEliminateSuspectByVote = (suspectId, isPoliceArrest = false) => {
@@ -1790,6 +1990,9 @@ export default function App() {
         dayState: {
           ...prev.dayState,
           eliminatedTodayId: suspectId,
+          tieCandidateIds: [],
+          voteNotice: '',
+          votingClosed: isPoliceArrest ? prev.dayState.votingClosed : true,
           policeArrestUsed: isPoliceArrest
             ? true
             : prev.dayState.policeArrestUsed,
@@ -2648,6 +2851,27 @@ export default function App() {
                         save the exact same person two nights in a row.
                       </span>
                     </label>
+                    <label className="flex items-start gap-3 cursor-pointer text-xs text-[#4A5D56] mt-3">
+                      <input
+                        type="checkbox"
+                        checked={!!gameState.rules.godTieBreaker}
+                        onChange={(e) =>
+                          commitGameState((prev) => ({
+                            ...prev,
+                            rules: {
+                              ...prev.rules,
+                              godTieBreaker: e.target.checked,
+                            },
+                          }))
+                        }
+                        className="mt-0.5 accent-[#1C4538]"
+                      />
+                      <span>
+                        <strong>Moderator’s Casting Vote:</strong> If the ballot
+                        ends in a tie, the God (spectator) chooses who is
+                        banished. If off, a tie banishes no one.
+                      </span>
+                    </label>
                   </div>
                 </div>
               </div>
@@ -2776,6 +3000,20 @@ export default function App() {
              ================================================================= */}
           {activePerspective === 'PLAYER_DEVICE' && (
             <div className="max-w-xl mx-auto py-4 animate-fadeIn">
+              {gameState.phase === 'DAY' && (
+                <div className="mb-4 flex items-center justify-between px-5 py-3 rounded-2xl bg-[#FFFDF9] border border-[#E5DEC9] text-[#14362B]">
+                  <span className="flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-[#9E7642] font-semibold">
+                    <Timer className="w-4 h-4" /> Debate timer
+                  </span>
+                  <span
+                    className={`font-mono text-2xl font-bold ${
+                      timerSeconds <= 10 && timerRunning ? 'text-[#D96B6B]' : ''
+                    }`}
+                  >
+                    {formatTime(timerSeconds)}
+                  </span>
+                </div>
+              )}
               {gameState.phase === 'LOBBY' || gameState.phase === 'ROLE_SETUP' ? (
                 <div className="border rounded-3xl p-8 sm:p-10 shadow-lg text-center bg-[#FFFDF9] border-[#E5DEC9] text-[#14362B]">
                   <Eyebrow className="justify-center mb-3">
@@ -2785,11 +3023,45 @@ export default function App() {
                     The parlor is{' '}
                     <span className="italic text-[#A67C46]">gathering.</span>
                   </h2>
-                  <p className="text-sm text-[#4A5D56] leading-relaxed">
-                    {godPlayer?.name} is still arranging guests and roles. Your
-                    cipher entry will appear here automatically once chits are
-                    dealt.
-                  </p>
+                  {!isHost && !myPlayer && gameState.phase === 'LOBBY' ? (
+                    <form
+                      onSubmit={handleTakeSeat}
+                      className="max-w-xs mx-auto space-y-4 mt-5"
+                    >
+                      <p className="text-sm text-[#4A5D56]">
+                        Enter your name to take a seat at the table.
+                      </p>
+                      <input
+                        type="text"
+                        maxLength={20}
+                        autoComplete="off"
+                        value={seatNameInput}
+                        onChange={(e) => setSeatNameInput(e.target.value)}
+                        placeholder="Your name"
+                        className="w-full text-center text-lg py-3 px-5 rounded-2xl border-2 bg-[#FAF7F0] border-[#D8D1C5] text-[#14362B] focus:outline-none focus:border-[#1C4538]"
+                      />
+                      {seatError && (
+                        <p className="text-xs text-[#D96B6B] font-medium">
+                          {seatError}
+                        </p>
+                      )}
+                      <PrimaryButton type="submit" className="w-full py-3.5">
+                        Take My Seat
+                      </PrimaryButton>
+                    </form>
+                  ) : (
+                    <p className="text-sm text-[#4A5D56] leading-relaxed">
+                      {myPlayer ? (
+                        <>
+                          You are seated as{' '}
+                          <strong className="text-[#14362B]">{myPlayer.name}</strong>.{' '}
+                        </>
+                      ) : null}
+                      {godPlayer?.name} is still arranging guests and roles. Your
+                      cipher entry will appear here automatically once chits are
+                      dealt.
+                    </p>
+                  )}
                 </div>
               ) : !unlockedPlayerId ? (
                 /* Secret Code Entry Card */
@@ -2895,10 +3167,25 @@ export default function App() {
                           Cast your accusation{' '}
                           <span className="italic text-[#A67C46]">vote.</span>
                         </h3>
-                        <p className="text-xs text-[#4A5D56] mb-4">
-                          Tap a living suspect below to register your vote on
-                          the Moderator’s tally.
-                        </p>
+                        {gameState.dayState.votingClosed ||
+                        (gameState.dayState.tieCandidateIds || []).length > 0 ? (
+                          <p className="text-xs text-[#8B2626] font-medium mb-4">
+                            {gameState.dayState.votingClosed
+                              ? 'The ballot is closed.'
+                              : 'The ballot is tied — the Moderator is deciding.'}
+                          </p>
+                        ) : (
+                          <p className="text-xs text-[#4A5D56] mb-4">
+                            Tap a suspect to vote. You can change your vote any
+                            time until the ballot is counted.
+                          </p>
+                        )}
+                        {gameState.dayState.voteNotice &&
+                          !gameState.dayState.votingClosed && (
+                            <p className="text-xs text-[#9E7642] mb-4">
+                              {gameState.dayState.voteNotice}
+                            </p>
+                          )}
                         <div className="grid grid-cols-2 gap-2.5">
                           {livingActivePlayers.map((suspect) => {
                             const myCurrentVote =
@@ -2910,13 +3197,18 @@ export default function App() {
                               <button
                                 key={suspect.id}
                                 type="button"
+                                disabled={
+                                  gameState.dayState.votingClosed ||
+                                  (gameState.dayState.tieCandidateIds || [])
+                                    .length > 0
+                                }
                                 onClick={() =>
                                   handlePlayerCastVote(
                                     unlockedPlayerId,
                                     suspect.id
                                   )
                                 }
-                                className={`p-3 rounded-xl border text-left text-xs font-medium transition-all flex items-center justify-between cursor-pointer ${
+                                className={`p-3 rounded-xl border text-left text-xs font-medium transition-all flex items-center justify-between cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed ${
                                   isVoted
                                     ? 'bg-[#1C4538] text-[#FAF7F0] border-[#1C4538]'
                                     : 'bg-[#FAF7F0] text-[#14362B] border-[#D8D1C5] hover:border-[#9E7642]'
@@ -3725,9 +4017,7 @@ export default function App() {
                               key={mins}
                               type="button"
                               onClick={() => {
-                                setTimerPresetMinutes(mins);
-                                setTimerSeconds(mins * 60);
-                                setTimerRunning(false);
+                                setTimerPreset(mins);
                               }}
                               className={`px-3 py-1.5 rounded-full text-xs font-medium border cursor-pointer ${
                                 timerPresetMinutes === mins
@@ -3753,8 +4043,7 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => {
-                              setTimerRunning(false);
-                              setTimerSeconds(timerPresetMinutes * 60);
+                              resetTimer();
                             }}
                             className="p-2.5 rounded-full bg-[#FFFDF9] border border-[#D8D1C5] text-[#14362B] hover:bg-[#E5DEC9] cursor-pointer"
                             title="Reset timer"
@@ -3763,6 +4052,65 @@ export default function App() {
                           </button>
                         </div>
                       </div>
+
+                      {/* Count Ballots: banish the highest-voted suspect */}
+                      {(() => {
+                        const castCount = livingActivePlayers.filter(
+                          (p) => gameState.dayState.votesByVoter?.[p.id]
+                        ).length;
+                        const tieIds = gameState.dayState.tieCandidateIds || [];
+                        return (
+                          <div className="p-5 rounded-2xl bg-[#FAF7F0] border border-[#D8D1C5] space-y-3">
+                            <div className="flex flex-wrap items-center justify-between gap-3">
+                              <div>
+                                <span className="text-[10px] uppercase tracking-[0.18em] text-[#9E7642] font-semibold block">
+                                  BALLOT COUNT
+                                </span>
+                                <span className="text-sm text-[#14362B]">
+                                  {castCount} of {livingActivePlayers.length}{' '}
+                                  guests have voted
+                                </span>
+                              </div>
+                              {!gameState.dayState.votingClosed && (
+                                <PrimaryButton
+                                  onClick={handleCountBallots}
+                                  disabled={tieIds.length > 0}
+                                >
+                                  Count Ballots & Banish Leader
+                                </PrimaryButton>
+                              )}
+                            </div>
+                            {gameState.dayState.voteNotice &&
+                              !gameState.dayState.votingClosed && (
+                                <p className="text-xs text-[#8B6229] font-medium">
+                                  {gameState.dayState.voteNotice}
+                                </p>
+                              )}
+                            {tieIds.length > 0 &&
+                              !gameState.dayState.votingClosed && (
+                                <div className="flex flex-wrap gap-2 pt-1">
+                                  {tieIds.map((id) => {
+                                    const t = gameState.players.find(
+                                      (x) => x.id === id
+                                    );
+                                    return (
+                                      <button
+                                        key={id}
+                                        type="button"
+                                        onClick={() =>
+                                          handleEliminateSuspectByVote(id, false)
+                                        }
+                                        className="px-3.5 py-1.5 rounded-full text-xs font-medium bg-[#8B2626] text-[#FFFDF9] hover:bg-[#6E1B1B] cursor-pointer"
+                                      >
+                                        Banish {t?.name}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                          </div>
+                        );
+                      })()}
 
                       {/* Voting Tally & Elimination Controls */}
                       <div>
