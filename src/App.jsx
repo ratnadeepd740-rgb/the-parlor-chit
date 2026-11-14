@@ -892,6 +892,13 @@ export default function App() {
   // 1. FIREBASE AUTH & REAL-TIME ROOM SYNC
   // ============================================================================
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const roomParam = params.get('room');
+    if (roomParam && roomParam.trim().length === 5) {
+      setJoinCodeInput(roomParam.trim().toUpperCase());
+    }
+  }, []);
+  useEffect(() => {
     if (!auth) return;
     const initAuth = async () => {
       try {
