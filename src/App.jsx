@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { initializeApp } from 'firebase/app';
+import { initializeApp, getApps } from 'firebase/app';
 import {
   getAuth,
   signInAnonymously,
@@ -50,18 +50,31 @@ import {
 } from 'lucide-react';
 
 // ============================================================================
-// FIREBASE INITIALIZATION (WITH GRACEFUL OFFLINE / LOCAL FALLBACK)
+// FIREBASE INITIALIZATION (READS VERCEL ENV VARIABLE + LOCAL FALLBACK)
 // ============================================================================
 let db = null;
 let auth = null;
 let appId = 'parlor-chit-game';
 
 try {
-  if (typeof __firebase_config !== 'undefined' && __firebase_config) {
-    const firebaseConfig = JSON.parse(__firebase_config);
-    const app = initializeApp(firebaseConfig);
-    auth = getAuth(app);
-    db = getFirestore(app);
+  const rawConfig =
+    typeof import.meta !== 'undefined' &&
+    import.meta.env &&
+    import.meta.env.VITE_FIREBASE_CONFIG
+      ? import.meta.env.VITE_FIREBASE_CONFIG
+      : typeof __firebase_config !== 'undefined' && __firebase_config
+      ? __firebase_config
+      : null;
+
+  if (rawConfig) {
+    const firebaseConfig =
+      typeof rawConfig === 'string' ? JSON.parse(rawConfig) : rawConfig;
+    if (firebaseConfig && firebaseConfig.apiKey) {
+      const app =
+        getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
+      auth = getAuth(app);
+      db = getFirestore(app);
+    }
   }
   if (typeof __app_id !== 'undefined' && __app_id) {
     appId = __app_id;
@@ -149,25 +162,25 @@ const ROLES = {
 
 const SAMPLE_PARTIES = {
   classic7: [
-    'Arthur',
-    'Beatrice',
-    'Clara',
-    'Dorian',
-    'Eleanor',
-    'felix',
-    'Genevieve',
+    'P1',
+    'P2',
+    'P3',
+    'P4',
+    'P5',
+    'P6',
+    'P7',
   ].map((n) => n.charAt(0).toUpperCase() + n.slice(1)),
   salon10: [
-    'Arthur',
-    'Beatrice',
-    'Clara',
-    'Dorian',
-    'Eleanor',
-    'Felix',
-    'Genevieve',
-    'Hugo',
-    'Imogen',
-    'Julian',
+    'P1',
+    'P2',
+    'P3',
+    'P4',
+    'P5',
+    'P6',
+    'P7',
+    'P8',
+    'P9',
+    'P10',
   ],
 };
 
