@@ -1769,6 +1769,19 @@ export default function App() {
     return null;
   };
 
+  // Murderers can never target themselves or a fellow Murderer
+  const handleSelectMurdererTarget = (targetId) => {
+    const target = gameStateRef.current.players.find((p) => p.id === targetId);
+    if (!target || target.role === 'MURDERER') {
+      triggerToast('Murderers cannot target themselves or a fellow Murderer.');
+      return;
+    }
+    commitGameState((prev) => ({
+      ...prev,
+      nightState: { ...prev.nightState, murdererTargetId: targetId },
+    }));
+  };
+
   const beginNightPhase = () => {
     setTimerRunning(false);
     commitGameState((prev) => ({
@@ -1786,7 +1799,10 @@ export default function App() {
 
   const resolveNightAndTransitionToDay = () => {
     commitGameState((prev) => {
-      const targetId = prev.nightState.murdererTargetId;
+      // Safety net: an invalid (Murderer) target is ignored, so nobody dies from it
+      const rawTargetId = prev.nightState.murdererTargetId;
+      const rawTarget = prev.players.find((p) => p.id === rawTargetId);
+      const targetId = rawTarget && rawTarget.role !== 'MURDERER' ? rawTargetId : null;
       const savedId = prev.nightState.doctorSaveId;
       let eliminatedPlayer = null;
 
@@ -1824,6 +1840,9 @@ export default function App() {
         ...prev,
         players: updatedPlayers,
         phase: winCheck ? 'GAME_OVER' : 'DAY',
+        timer: winCheck
+          ? { ...(prev.timer || DEFAULT_TIMER), running: false, endsAt: null }
+          : prev.timer,
         winner: winCheck ? winCheck.winner : null,
         winReason: winCheck ? winCheck.reason : '',
         nightState: {
@@ -1985,6 +2004,9 @@ export default function App() {
         ...prev,
         players: updatedPlayers,
         phase: winCheck ? 'GAME_OVER' : prev.phase,
+        timer: winCheck
+          ? { ...(prev.timer || DEFAULT_TIMER), running: false, endsAt: null }
+          : prev.timer,
         winner: winCheck ? winCheck.winner : null,
         winReason: winCheck ? winCheck.reason : '',
         dayState: {
@@ -3014,7 +3036,50 @@ export default function App() {
                   </span>
                 </div>
               )}
-              {gameState.phase === 'LOBBY' || gameState.phase === 'ROLE_SETUP' ? (
+              {gameState.phase === 'GAME_OVER' ? (
+                <div className="border-2 border-[#9E7642] rounded-3xl p-8 shadow-xl text-center bg-[#FFFDF9] text-[#14362B] space-y-5">
+                  <Eyebrow className="justify-center">THE PARLOR HAS SPOKEN</Eyebrow>
+                  <h2 className="font-serif text-4xl">
+                    {gameState.winner === 'VILLAGER' ? (
+                      <>
+                        Villagers{' '}
+                        <span className="italic text-[#A67C46]">win!</span>
+                      </>
+                    ) : (
+                      <>
+                        Murderers{' '}
+                        <span className="italic text-[#8B2626]">win!</span>
+                      </>
+                    )}
+                  </h2>
+                  <p className="text-sm text-[#4A5D56] leading-relaxed">
+                    {gameState.winReason}
+                  </p>
+                  <div className="text-left space-y-2 pt-2">
+                    {gameState.players
+                      .filter((pl) => pl.id !== gameState.godPlayerId)
+                      .map((pl) => (
+                        <div
+                          key={pl.id}
+                          className="flex items-center justify-between px-4 py-2.5 rounded-xl bg-[#FAF7F0] border border-[#E5DEC9] text-sm"
+                        >
+                          <span
+                            className={
+                              pl.status === 'ALIVE'
+                                ? 'font-medium'
+                                : 'line-through opacity-60'
+                            }
+                          >
+                            {pl.name}
+                          </span>
+                          <span className="text-[11px] uppercase tracking-wider text-[#9E7642] font-semibold">
+                            {ROLES[pl.role]?.title || pl.role}
+                          </span>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              ) : gameState.phase === 'LOBBY' || gameState.phase === 'ROLE_SETUP' ? (
                 <div className="border rounded-3xl p-8 sm:p-10 shadow-lg text-center bg-[#FFFDF9] border-[#E5DEC9] text-[#14362B]">
                   <Eyebrow className="justify-center mb-3">
                     WAITING FOR THE HOST
@@ -3625,16 +3690,11 @@ export default function App() {
                                   <button
                                     key={p.id}
                                     type="button"
-                                    onClick={() =>
-                                      commitGameState((prev) => ({
-                                        ...prev,
-                                        nightState: {
-                                          ...prev.nightState,
-                                          murdererTargetId: p.id,
-                                        },
-                                      }))
+                                    disabled={
+                                      p.role === 'MURDERER' && !hideGodSpoilers
                                     }
-                                    className={`p-3.5 rounded-2xl border text-left transition-all cursor-pointer ${
+                                    onClick={() => handleSelectMurdererTarget(p.id)}
+                                    className={`p-3.5 rounded-2xl border text-left transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
                                       isSelected
                                         ? 'bg-[#8B2626] text-[#FAF7F0] border-[#E07A7A] shadow-md'
                                         : 'bg-[#0D1F19] text-[#F5EFE6] border-[#284C3F] hover:border-[#C94A4A]'
