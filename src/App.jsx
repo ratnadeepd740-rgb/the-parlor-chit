@@ -860,6 +860,8 @@ export default function App() {
   const [myPlayerId, setMyPlayerId] = useState(null);
   const [seatNameInput, setSeatNameInput] = useState('');
   const [seatError, setSeatError] = useState('');
+  const [handoverCodeInput, setHandoverCodeInput] = useState('');
+  const [handoverError, setHandoverError] = useState('');
 
   // Core Game State (Synced with Firestore in ONLINE mode)
   const [gameState, setGameState] = useState({
@@ -932,9 +934,21 @@ export default function App() {
   const myPlayer = gameState.players.find((p) => p.id === myPlayerId) || null;
 
   // Host = the device that created the room (always true offline)
+  // Online, the "host" is whichever device currently holds the God Console (starts as the room creator)
+  const consoleOwnerUid = gameState.godUid || gameState.hostUid;
   const isHost =
     gameMode !== 'ONLINE' ||
-    (!!user && !!gameState.hostUid && gameState.hostUid === user.uid);
+    (!!user && !!consoleOwnerUid && consoleOwnerUid === user.uid);
+
+  // Handover: the chosen God's phone is linked to their seat but doesn't own the console yet
+  const godSeat = gameState.players.find((p) => p.id === gameState.godPlayerId);
+  const handoverPending =
+    gameMode === 'ONLINE' &&
+    !!godSeat?.claimedByUid &&
+    !!consoleOwnerUid &&
+    godSeat.claimedByUid !== consoleOwnerUid;
+  const amChosenGod =
+    handoverPending && !!user && godSeat.claimedByUid === user.uid;
 
   // Toast Notification helper
   const triggerToast = (msg) => {
@@ -1178,6 +1192,7 @@ export default function App() {
         mode: 'ONLINE',
         phase: 'LOBBY',
         hostUid: user.uid,
+        godUid: user.uid,
       };
       await setDoc(getRoomRef(newCode), initialState);
 
@@ -1211,7 +1226,7 @@ export default function App() {
         return false;
       }
       const data = snap.data();
-      const amHost = !!data.hostUid && data.hostUid === user.uid;
+      const amHost = (data.godUid || data.hostUid) === user.uid;
       gameStateRef.current = data;
       setGameState(data);
       setGameMode('ONLINE');
@@ -1283,6 +1298,7 @@ export default function App() {
           {
             id: newId,
             name,
+            claimedByUid: user.uid,
             code: '',
             role: 'VILLAGER',
             isGod: false,
@@ -1310,6 +1326,108 @@ export default function App() {
       setSeatError(msgs[err.message] || 'Could not take a seat. Please try again.');
     }
   };
+
+  // Link this device to an existing roster seat (e.g. a name the host typed in)
+  const handleClaimSeat = async (playerId) => {
+    if (!db || !user || !roomCode) return;
+    try {
+      await runTransaction(db, async (tx) => {
+        const ref = getRoomRef(roomCode);
+        const snap = await tx.get(ref);
+        if (!snap.exists()) throw new Error('ROOM_GONE');
+        const d = snap.data();
+        const target = d.players.find((p) => p.id === playerId);
+        if (!target) throw new Error('GONE');
+        if (target.claimedByUid && target.claimedByUid !== user.uid)
+          throw new Error('TAKEN');
+        const players = d.players.map((p) =>
+          p.id === playerId
+            ? { ...p, claimedByUid: user.uid }
+            : p.claimedByUid === user.uid
+            ? { ...p, claimedByUid: null }
+            : p
+        );
+        tx.update(ref, { players });
+      });
+      setMyPlayerId(playerId);
+      setSeatError('');
+      triggerToast('Seat linked to this device.');
+    } catch (err) {
+      const msgs = {
+        ROOM_GONE: 'This room no longer exists.',
+        GONE: 'That seat no longer exists.',
+        TAKEN: 'Someone else already claimed that seat.',
+      };
+      setSeatError(msgs[err.message] || 'Could not claim that seat.');
+    }
+  };
+
+  // The chosen God sets a fresh passcode and takes ownership of the console
+  const handleConfirmGodHandover = async (e) => {
+    if (e) e.preventDefault();
+    const cleaned = handoverCodeInput.trim().toUpperCase();
+    if (cleaned.length < 3 || cleaned.length > 8) {
+      setHandoverError('Passcode must be 3 to 8 characters.');
+      return;
+    }
+    if (!db || !user || !roomCode) return;
+    try {
+      await runTransaction(db, async (tx) => {
+        const ref = getRoomRef(roomCode);
+        const snap = await tx.get(ref);
+        if (!snap.exists()) throw new Error('ROOM_GONE');
+        const d = snap.data();
+        const seat = d.players.find((p) => p.id === d.godPlayerId);
+        if (!seat || seat.claimedByUid !== user.uid) throw new Error('NOT_GOD');
+        if (cleaned === (d.godPasscode || '0000').toUpperCase())
+          throw new Error('SAME_CODE');
+        tx.update(ref, { godPasscode: cleaned, godUid: user.uid });
+      });
+      setHandoverCodeInput('');
+      setHandoverError('');
+    } catch (err) {
+      const msgs = {
+        ROOM_GONE: 'This room no longer exists.',
+        NOT_GOD: 'You are no longer the chosen God.',
+        SAME_CODE: 'Choose a NEW passcode — the old one is known to the previous God.',
+      };
+      setHandoverError(msgs[err.message] || 'Could not take over. Please try again.');
+    }
+  };
+
+  // When console ownership moves between devices, flip each device to the right screen
+  const godDeviceRef = useRef(null);
+  useEffect(() => {
+    if (gameMode !== 'ONLINE' || !user) {
+      godDeviceRef.current = null;
+      return;
+    }
+    const prev = godDeviceRef.current;
+    godDeviceRef.current = isHost;
+    if (prev === null || prev === isHost) return;
+    setUnlockedPlayerId(null);
+    setChitPinInput('');
+    if (isHost) {
+      const ph = gameStateRef.current.phase;
+      setActivePerspective('GOD');
+      setIsGodAuthenticated(true);
+      setScreen(ph === 'LOBBY' ? 'LOBBY' : ph === 'ROLE_SETUP' ? 'ROLE_SETUP' : 'GAME_TABLE');
+      triggerToast('You are now the God. The console is yours.');
+    } else {
+      setActivePerspective('PLAYER_DEVICE');
+      setIsGodAuthenticated(false);
+      setScreen('GAME_TABLE');
+      triggerToast('A new God has taken over. You are now a regular guest.');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameMode, isHost, user]);
+
+  // While a handover is pending, the outgoing God's in-game console stays locked
+  useEffect(() => {
+    if (handoverPending && isHost && screen === 'GAME_TABLE') {
+      setIsGodAuthenticated(false);
+    }
+  }, [handoverPending, isHost, screen]);
 
   // Auto-rejoin the last room after a page refresh
   const triedRejoin = useRef(false);
@@ -1352,7 +1470,11 @@ export default function App() {
   const handleVerifyGodPasscode = (e) => {
     if (e) e.preventDefault();
     if (!isHost) {
-      setGodPinError('Only the room host can open the God Console.');
+      setGodPinError('Only the current God can open the God Console.');
+      return;
+    }
+    if (handoverPending) {
+      setGodPinError('Console is locked: waiting for the new God to take over.');
       return;
     }
     const cleaned = godPinAttempt.trim().toUpperCase();
@@ -1619,6 +1741,12 @@ export default function App() {
   }, [gameState.roleCounts]);
 
   const handleDealChitsAndGenerateCodes = () => {
+    if (handoverPending) {
+      triggerToast(
+        `Waiting for ${godSeat?.name} to secure the console before dealing.`
+      );
+      return;
+    }
     const activeCount = activeNonGodPlayers.length;
     if (totalConfiguredRoles !== activeCount) {
       triggerToast(
@@ -2512,6 +2640,15 @@ export default function App() {
                 </span>
               </div>
 
+              {handoverPending && (
+                <div className="mb-4 p-4 rounded-2xl bg-[#9E7642]/10 border border-[#9E7642]/30 text-xs text-[#8B6229] leading-relaxed">
+                  <strong>{godSeat?.name}</strong> was chosen as God and has been
+                  asked to set a new passcode. Control passes to them the moment
+                  they confirm — you will then become a regular guest. You can
+                  still pick someone else until then.
+                </div>
+              )}
+
               {/* Player Pills Grid */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {gameState.players.map((p, idx) => {
@@ -2552,11 +2689,21 @@ export default function App() {
                             {isCurrentGod
                               ? 'God (Moderator)'
                               : 'Active Chit Player'}
+                            {p.claimedByUid ? ' • device linked' : ''}
                           </p>
                         </div>
                       </div>
 
                       <div className="flex items-center gap-1.5 shrink-0">
+                        {gameMode === 'ONLINE' && !myPlayer && !p.claimedByUid && (
+                          <button
+                            type="button"
+                            onClick={() => handleClaimSeat(p.id)}
+                            className="px-2.5 py-1 rounded-full text-[10px] font-semibold uppercase tracking-wider bg-[#9E7642]/15 text-[#8B6229] hover:bg-[#9E7642]/25 cursor-pointer"
+                          >
+                            That’s me
+                          </button>
+                        )}
                         <button
                           type="button"
                           title="Assign as God (Moderator)"
@@ -3022,6 +3169,38 @@ export default function App() {
              ================================================================= */}
           {activePerspective === 'PLAYER_DEVICE' && (
             <div className="max-w-xl mx-auto py-4 animate-fadeIn">
+              {amChosenGod && (
+                <form
+                  onSubmit={handleConfirmGodHandover}
+                  className="mb-5 border-2 border-[#9E7642] rounded-3xl p-6 bg-[#FFFDF9] text-[#14362B] space-y-4 shadow-lg"
+                >
+                  <Eyebrow>YOU HAVE BEEN CHOSEN</Eyebrow>
+                  <h2 className="font-serif text-3xl">
+                    You are the <span className="italic text-[#A67C46]">God!</span>
+                  </h2>
+                  <p className="text-sm text-[#4A5D56] leading-relaxed">
+                    The previous host still knows the current God passcode.
+                    Set a <strong>new passcode</strong> so nobody else can open
+                    your console. As soon as you confirm, the console moves to
+                    this phone and the previous host becomes a normal player.
+                  </p>
+                  <input
+                    type="text"
+                    maxLength={8}
+                    autoComplete="off"
+                    value={handoverCodeInput}
+                    onChange={(e) => setHandoverCodeInput(e.target.value.toUpperCase())}
+                    placeholder="New God passcode (3–8 characters)"
+                    className="w-full text-center text-lg tracking-[0.2em] py-3 px-5 rounded-2xl border-2 bg-[#FAF7F0] border-[#D8D1C5] text-[#14362B] focus:outline-none focus:border-[#1C4538]"
+                  />
+                  {handoverError && (
+                    <p className="text-xs text-[#D96B6B] font-medium">{handoverError}</p>
+                  )}
+                  <PrimaryButton type="submit" className="w-full py-3.5">
+                    Secure Console & Take Over
+                  </PrimaryButton>
+                </form>
+              )}
               {gameState.phase === 'DAY' && (
                 <div className="mb-4 flex items-center justify-between px-5 py-3 rounded-2xl bg-[#FFFDF9] border border-[#E5DEC9] text-[#14362B]">
                   <span className="flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-[#9E7642] font-semibold">
@@ -3127,6 +3306,34 @@ export default function App() {
                       dealt.
                     </p>
                   )}
+                  {!isHost &&
+                    !myPlayer &&
+                    gameState.players.some((pl) => !pl.claimedByUid) && (
+                      <div className="mt-6 pt-5 border-t border-[#E5DEC9] text-left">
+                        <p className="text-xs text-[#4A5D56] mb-3 text-center">
+                          Already on the host’s list? Tap your name:
+                        </p>
+                        <div className="flex flex-wrap justify-center gap-2">
+                          {gameState.players
+                            .filter((pl) => !pl.claimedByUid)
+                            .map((pl) => (
+                              <button
+                                key={pl.id}
+                                type="button"
+                                onClick={() => handleClaimSeat(pl.id)}
+                                className="px-3.5 py-1.5 rounded-full text-xs font-medium bg-[#1C4538] text-[#FAF7F0] hover:bg-[#14362B] cursor-pointer"
+                              >
+                                {pl.name}
+                              </button>
+                            ))}
+                        </div>
+                        {seatError && (
+                          <p className="text-xs text-[#D96B6B] font-medium mt-3 text-center">
+                            {seatError}
+                          </p>
+                        )}
+                      </div>
+                    )}
                 </div>
               ) : !unlockedPlayerId ? (
                 /* Secret Code Entry Card */
